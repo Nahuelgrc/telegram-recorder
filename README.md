@@ -1,52 +1,71 @@
 # Tapo C200 Security Pipeline: Scrypted + Docker Sidecar + Telegram
 
-This repository contains a production-ready architectural solution optimized for automating security alerts (Instant Snapshot + 5-second Video Clip) triggered by motion events from **TP-Link Tapo C200** cameras (or any ONVIF-compatible camera).
+## 1. General Description
 
-The solution is specifically designed for resource-constrained environments (like a **Raspberry Pi**), keeping CPU usage close to **0% at rest** and protecting physical storage against continuous write wear and tear by leveraging RAM storage.
+This repository provides a production-grade, highly optimized architectural solution to automate home security alerts. It delivers **Instant Photo Snapshots** followed by a **5-second Video Clip** straight to a Telegram chat whenever a camera detects motion. 
+
+Designed specifically for resource-constrained edge hardware like a **Raspberry Pi**, this pipeline maintains a **near-0% idle CPU footprint** and protects your physical storage (SD card/SSD) from wear and tear. It bypasses commercial paid NVR features by implementing a lightweight **Docker Sidecar Pattern** using Python and FFmpeg, hooking directly into Scrypted's internal RTSP rebroadcast layer.
 
 ---
 
-## 🏗️ System Architecture
+## 2. Scrypted Installation & ONVIF Plugin Setup
 
-To bypass expensive video processing analytics and commercial paid NVR modules, a **Sidecar Pattern** was implemented using an isolated Python microservice that interacts privately with the free Scrypted core.
+### Step 1: Deploy Scrypted via Docker
+Run the following command to spin up the official Scrypted container with persistent storage and necessary port mappings:
 
+```bash
+docker run -d \
+  --name scrypted \
+  --restart unless-stopped \
+  -v ~/.scrypted://.scrypted \
+  -p 10443:10443 \
+  -p 40985:40985 \
+  -p 36375:36375 \
+  koush/scrypted
 ```
-[ Tapo C200 ] --- (Hardware Detection / ONVIF Webhook) ---> [ Scrypted Container ]
-                                                                       |
-                                         +-----------------------------+
-                                         | (Immediate Action)          | (Async POST Trigger)
-                                         v                             v
-                                  [ Telegram API ]             [ telegram-recorder ] (Sidecar)
-                                  📸 Send Snapshot                     |
-                                                                       |-- Capture RTSP from Scrypted
-                                                                       |-- Hybrid Muxing with FFmpeg
-                                                                       v
-                                                                [ Telegram API ]
-                                                                📹 Send Video Clip (.mp4)
-```
+*Once initialized, open your browser and access the management console at `https://localhost:10443` (or your server's local IP).*
 
-### Key Architectural Strengths:
-1. **Native Hardware Detection (0% CPU):** Scrypted does not analyze pixels via software; it subscribes to the camera's ONVIF webhook. The CPU impact on the host is zero.
-2. **Minimal Snapshot Latency:** The Action Script inside Scrypted dispatches the snapshot to Telegram instantly when the event is triggered.
-3. **Concurrent Stream Bypass:** The Sidecar recorder does not overload the camera by requesting a second video stream; it hooks into the *RTSP Rebroadcast* that Scrypted already keeps open in memory.
-4. **Lightweight Hybrid Muxing:** FFmpeg performs a direct copy of the H.264 video stream (0% CPU) and only transcodes the PCM audio to AAC to ensure native playback compatibility on mobile devices and Telegram.
+### Step 2: Install the ONVIF Plugin
+1. In the Scrypted web UI, navigate to the **Plugins** management section in the left sidebar.
+2. Search for the official **ONVIF** plugin.
+3. Click **Install**. This plugin allows Scrypted to handle PTZ controls and, crucially, subscribe to native hardware motion webhooks from the camera.
 
 ---
 
-## 📁 Suggested Repository Structure
+## 3. ONVIF Camera Configuration
 
-* `app.py`: Code for the Python Flask server exposing the recording and dispatch microservice.
-* `script.js`: JavaScript code (Async/Await) to configure inside the Scrypted automation engine.
-* `Dockerfile`: Docker image build recipe for the video recorder.
-* `README.md`: This guide file.
+1. Inside Scrypted, click on the **ONVIF Plugin** and select **Add Device**. 
+2. Enter your Tapo C200 local IP address, along with the device's local account username and password (configured via the Tapo App).
+3. Once the camera is added, go to its settings and select the **Streams** tab -> **Stream: Mainstream**.
+4. Change the **RTSP Parser** option to **`FFmpeg (TCP)`**. This ensures absolute stream stability against Wi-Fi micro-drops and prevents green screen artifacts.
+5. Look for the **RTSP Rebroadcast Url** field (e.g., `rtsp://localhost:36375/5f3892d1...`) and copy it. You will need this string for your backend setup, replacing `localhost` with `scrypted`.
 
 ---
 
-## 🛠️ Deployment & Installation Guide
+## 4. Telegram Bot Configuration
 
-### 1. Local Environment and Files
-Create a dedicated folder on your server or development computer (e.g., `C:\grabador-telegram` or `~/grabador-telegram`) and place the `app.py` and the following `Dockerfile` there:
+Before deploying the codebase, you must set up your automated Telegram pipeline endpoints:
 
+1. **Get a Bot Token:** Chat with `@BotFather` on Telegram, send the `/newbot` command, and follow the steps to generate your unique `TELEGRAM_BOT_TOKEN`.
+2. **Get your Chat ID:** Start a conversation/group with your newly created bot, send any message, and retrieve your `YOUR_TELEGRAM_CHAT_ID` by visiting `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in your browser.
+
+---
+
+## 5. Automation Script Deployment
+
+1. In the Scrypted console, create a new Automation rule.
+2. Set the **Trigger** to listen to the native motion detection event of your newly added ONVIF camera.
+3. Under the **Actions** section, select **Script** (JavaScript) as the execution block.
+4. Copy the contents of the `script.js` file provided in this repository, paste it into the editor, fill in your Telegram credentials, and click **Save**.
+
+---
+
+## 6. Video Recorder Sidecar Deployment (app.py & Dockerfile)
+
+### Step 1: Create the Source Files
+In a dedicated local directory (e.g., `~/grabador-telegram`), create your Python backend `app.py` and your configuration `Dockerfile`.
+
+**Dockerfile:**
 ```dockerfile
 FROM python:3.10-slim
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
@@ -56,49 +75,31 @@ COPY app.py .
 CMD ["python", "app.py"]
 ```
 
-> ⚠️ **Important:** Make sure to configure the corresponding environment variables or constants for your **Telegram Token**, **Chat ID**, and the internal Scrypted **RTSP URL** inside your `app.py`.
-
-### 2. Virtual Network and Container Configuration
-Run the following sequence of commands in your terminal to build the image and establish the internal Docker DNS communication bridge:
+### Step 2: Set Up the Docker Network Link
+To allow the sidecar recorder to safely pull streams from Scrypted without exposing credentials publicly, tie them together inside an internal Docker network bridge:
 
 ```bash
-# Create the private Docker virtual network
+# 1. Create a private virtual network bridge
 docker network create red-domotica
 
-# Connect your existing Scrypted container to the new network
-# (Change 'scrypted' to your container's real name if it differs)
+# 2. Attach your running Scrypted container to this network
 docker network connect red-domotica scrypted
 
-# Build the local Sidecar recorder image
+# 3. Build your custom Sidecar image from your local directory
 docker build -t telegram-recorder .
 
-# Initialize the Sidecar container integrated into the network
+# 4. Run the Sidecar container attached to the same network bridge
 docker run -d --name telegram-recorder --network red-domotica telegram-recorder
 ```
 
-### 3. Device Configuration in Scrypted
-1. Add the camera using the native **ONVIF** plugin. This allows receiving hardware motion triggers from the Tapo.
-2. Go to the **Streams** tab -> **Stream: Mainstream**.
-3. In the **RTSP Parser** option, select **`FFmpeg (TCP)`**. This ensures immunity against Wi-Fi micro-drops and prevents green artifacts in the stream.
-4. Copy the URL listed under **RTSP Rebroadcast Url** (e.g., `rtsp://localhost:36375/XXXXX`). In your `app.py`, use this exact URL, replacing the word `localhost` with `scrypted` (so Docker can resolve the internal DNS).
+### 💡 Production Optimization for Raspberry Pi (Disk Protection)
+To completely prevent storage hardware degradation from constant input/output video writes, you can configure the temporary files to run purely inside your physical RAM space via Linux's native `/dev/shm` shared memory structure.
 
-### 4. Setting up the Automation
-1. In Scrypted, create a new automation whose *Trigger* is the camera's ONVIF motion event.
-2. In the *Actions* section, add a **Script** (JavaScript) block.
-3. Paste the code from your `script.js` file.
-4. Save changes.
-
----
-
-## 💾 Production Configuration for Raspberry Pi (Disk Protection)
-
-To avoid premature wear of the SD card or SSD drive on a Raspberry Pi due to constant video writing and deleting, it is highly recommended to use the native Linux shared memory RAM filesystem (`/dev/shm`).
-
-1. In the `app.py` file, modify the temporary file path to point to the shared RAM:
+1. In your `app.py`, change the video output path line to:
    ```python
    output_path = "/dev/shm/clip.mp4"
    ```
-2. When starting the Docker container, mount the physical RAM volume by adding the `-v /dev/shm:/dev/shm` flag:
+2. Spin up your Docker execution command mounting the shared RAM system volume explicitly:
    ```bash
    docker run -d --name telegram-recorder --network red-domotica -v /dev/shm:/dev/shm telegram-recorder
    ```
@@ -106,4 +107,4 @@ To avoid premature wear of the SD card or SSD drive on a Raspberry Pi due to con
 ---
 
 ## 📄 License
-This project is distributed under the MIT License. Feel free to use, modify, and adapt it to your home automation infrastructure.
+This project is open-source software licensed under the MIT License.
